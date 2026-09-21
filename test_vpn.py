@@ -11,9 +11,15 @@ import aiohttp
 
 # Источники подписок
 SOURCES = [
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/white_list_vless.txt",
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/white_list_trojan.txt",
-    "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/all.txt"
+    # Репозиторий igareck/vpn-configs-for-russia
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_SS%2BAll_RUS.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    
+    # Репозиторий AvenCores/goida-vpn-configs
+    "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/1.txt",
+    "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/26.txt"
 ]
 
 PRIORITY_COUNTRIES = ['NL', 'DE', 'FR']  # Нидерланды, Германия, Франция
