@@ -17,8 +17,7 @@ SOURCES = [
     "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/26.txt"
 ]
 
-TEST_DOWNLOAD_URL = "http://cachefly.cachefly.net/10mb.test"  # Надежный HTTP CDN для теста скорости
-SPEED_TEST_DURATION = 3.0  # Максимальное время замера скорости на 1 узел (сек)
+TEST_DOWNLOAD_URL = "http://cachefly.cachefly.net/10mb.test"
 
 def decode_base64_if_needed(content):
     lines = [line.strip() for line in content.splitlines() if line.strip()]
@@ -53,7 +52,6 @@ def fetch_configs():
     return list(set(valid))
 
 def config_to_singbox(url_str, tag_name):
-    """Корректно конвертирует VLESS и Trojan в объект sing-box"""
     try:
         parsed = urllib.parse.urlparse(url_str)
         scheme = parsed.scheme.lower()
@@ -82,7 +80,7 @@ def config_to_singbox(url_str, tag_name):
                 tls_conf = {"enabled": True, "server_name": sni, "insecure": True}
                 if security == 'reality':
                     pbk = params.get('pbk', [''])[0]
-                    if not pbk:  # Reality без публичного ключа невалиден
+                    if not pbk:
                         return None
                     tls_conf["reality"] = {
                         "enabled": True,
@@ -124,28 +122,21 @@ def config_to_singbox(url_str, tag_name):
     except Exception:
         return None
 
-async def test_download_speed(session, proxy_url):
-    """Измеряет реальную скорость скачивания через HTTP-прокси в Мбит/с"""
-    start_time = time.time()
-    downloaded_bytes = 0
+def measure_speed_via_curl():
+    """Замеряет скорость скачивания через локальный прокси 127.0.0.1:1080 утилитой curl"""
+    cmd = [
+        "curl",
+        "-s",
+        "-o", "/dev/null",
+        "-w", "%{speed_download}",
+        "--max-time", "3",
+        "-x", "http://127.0.0.1:1080",
+        TEST_DOWNLOAD_URL
+    ]
     try:
-        async with session.get(TEST_DOWNLOAD_URL, proxy=proxy_url, timeout=SPEED_TEST_DURATION + 1) as response:
-            if response.status != 200:
-                return 0.0
-            
-            while True:
-                chunk = await response.content.read(65536)
-                if not chunk:
-                    break
-                downloaded_bytes += len(chunk)
-                if time.time() - start_time >= SPEED_TEST_DURATION:
-                    break
-
-        elapsed = time.time() - start_time
-        if elapsed <= 0 or downloaded_bytes == 0:
-            return 0.0
-
-        speed_mbps = (downloaded_bytes * 8) / (elapsed * 1_000_000)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        speed_bytes_sec = float(res.stdout.strip())
+        speed_mbps = (speed_bytes_sec * 8) / 1_000_000
         return round(speed_mbps, 2)
     except Exception:
         return 0.0
@@ -153,7 +144,6 @@ async def test_download_speed(session, proxy_url):
 async def run_full_test(configs):
     node_outbounds = []
     config_map = {}
-    tags = []
     
     for idx, cfg in enumerate(configs):
         tag = f"node-{idx}"
@@ -161,55 +151,32 @@ async def run_full_test(configs):
         if sb_obj:
             node_outbounds.append(sb_obj)
             config_map[tag] = cfg
-            tags.append(tag)
 
-    print(f"Сконвертировано валидных узлов для теста: {len(node_outbounds)}")
+    print(f"Сконвертировано валидных узлов: {len(node_outbounds)}")
     if not node_outbounds:
         return []
 
-    # Селектор должен быть ПЕРВЫМ элементом массиве outbounds
-    selector_group = {
-        "type": "selector",
-        "tag": "speed-tester",
-        "outbounds": tags
-    }
-    
-    # КРИТИЧНО: selector_group на первом месте, чтобы inbound по умолчанию попадал в него!
-    outbounds = [selector_group] + node_outbounds
-
+    # -------------------------------------------------------------
+    # ЭТАП 1: Быстрая фильтрация отклика (Clash API delay)
+    # -------------------------------------------------------------
     test_config = {
         "log": {"level": "warn"},
-        "inbounds": [
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": 1080
-            }
-        ],
         "experimental": {
             "clash_api": {
                 "external_controller": "127.0.0.1:9090"
             }
         },
-        "outbounds": outbounds
+        "outbounds": node_outbounds
     }
 
     with open("temp_runner.json", "w", encoding="utf-8") as f:
         json.dump(test_config, f)
 
-    proc = subprocess.Popen(["./sing-box", "run", "-c", "temp_runner.json"], stderr=subprocess.PIPE)
+    proc = subprocess.Popen(["./sing-box", "run", "-c", "temp_runner.json"])
     await asyncio.sleep(2.5)
 
-    if proc.poll() is not None:
-        _, err = proc.communicate()
-        print(f" Ошибка запуска sing-box: {err.decode('utf-8', errors='ignore')}")
-        return []
-
     delay_passed_nodes = []
-    
-    # ЭТАП 1: Проверка отклика (HTTP 204)
-    print("🔹 Этап 1: Проверка отклика (HTTP 204)...")
+    print("🔹 Этап 1: Проверка задержки и отклика (HTTP 204)...")
     async with aiohttp.ClientSession() as session:
         for tag, cfg in config_map.items():
             test_url = f"http://127.0.0.1:9090/proxies/{urllib.parse.quote(tag)}/delay?url=http://cp.cloudflare.com/generate_204&timeout=2000"
@@ -219,54 +186,67 @@ async def run_full_test(configs):
                         data = await resp.json()
                         delay = data.get("delay", 0)
                         if delay > 0:
-                            delay_passed_nodes.append({'config': cfg, 'delay': delay, 'tag': tag})
+                            delay_passed_nodes.append({'config': cfg, 'delay': delay, 'tag': tag, 'sb_obj': config_to_singbox(cfg, 'main-out')})
             except Exception:
                 pass
 
+    proc.terminate()
+    proc.wait()
+
     print(f"Ответило на запрос отклика: {len(delay_passed_nodes)} узлов.")
     if not delay_passed_nodes:
-        proc.terminate()
-        proc.wait()
         return []
 
     delay_passed_nodes.sort(key=lambda x: x['delay'])
-    candidates_for_speedtest = delay_passed_nodes[:30]
+    candidates = delay_passed_nodes[:15]  # Берем ТОП-15 лучших по задержке для измерения скорости
 
-    # ЭТАП 2: Замер скорости скачивания
-    print("🔹 Этап 2: Замер скорости скачивания (Download Speed)...")
+    # -------------------------------------------------------------
+    # ЭТАП 2: Поочередный замер скорости через изолированный sing-box + curl
+    # -------------------------------------------------------------
+    print("🔹 Этап 2: Поочередное тестирование скорости скачивания (3 сек на узел)...")
     final_nodes = []
-    proxy_local_url = "http://127.0.0.1:1080"
 
-    async with aiohttp.ClientSession() as session:
-        for item in candidates_for_speedtest:
-            tag = item['tag']
-            
-            # Переключаем активный узел в селекторе speed-tester
-            switch_payload = json.dumps({"name": tag}).encode('utf-8')
-            req = urllib.request.Request(
-                "http://127.0.0.1:9090/proxies/speed-tester",
-                data=switch_payload,
-                headers={"Content-Type": "application/json"},
-                method="PUT"
-            )
-            try:
-                urllib.request.urlopen(req, timeout=2)
-            except Exception as e:
-                print(f" Ошибка переключения на {tag}: {e}")
-                continue
+    for i, item in enumerate(candidates, 1):
+        # Формируем индивидуальный конфиг под 1 узел
+        single_config = {
+            "log": {"level": "warn"},
+            "inbounds": [
+                {
+                    "type": "mixed",
+                    "tag": "mixed-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": 1080
+                }
+            ],
+            "outbounds": [item['sb_obj']]
+        }
 
-            # Замер скорости скачивания через переключенный узел
-            download_speed_mbps = await test_download_speed(session, proxy_local_url)
-            
-            if download_speed_mbps > 0.1:
-                item['speed_mbps'] = download_speed_mbps
-                final_nodes.append(item)
-                print(f"✅ Узел {tag}: Скорость = {download_speed_mbps} Мбит/с | Пинг = {item['delay']} ms")
-            else:
-                print(f"❌ Узел {tag}: Не удалось выкачать тестовый файл")
+        with open("temp_single.json", "w", encoding="utf-8") as f:
+            json.dump(single_config, f)
 
-    proc.terminate()
-    proc.wait()
+        # Запускаем локальный sing-box под этот конкретный узел
+        single_proc = subprocess.Popen(["./sing-box", "run", "-c", "temp_single.json"])
+        await asyncio.sleep(1.0)  # Даем 1 сек на старт
+
+        # Замеряем скорость
+        speed_mbps = measure_speed_via_curl()
+
+        single_proc.terminate()
+        single_proc.wait()
+
+        if speed_mbps > 0.1:
+            item['speed_mbps'] = speed_mbps
+            final_nodes.append(item)
+            print(f"  [{i}/15] ✅ {item['tag']}: Скорость = {speed_mbps} Мбит/с | Пинг = {item['delay']} ms")
+        else:
+            print(f"  [{i}/15] ❌ {item['tag']}: Не удалось выкачать файл (0 Мбит/с)")
+
+    # Если никто не прошёл тест скорости, возвращаем первые 10 узлов по пингу (чтобы файлы не оставались пустыми)
+    if not final_nodes:
+        print("⚠️ Ни один узел не показал высокую скорость. Записываем лучшие по пингу.")
+        for item in candidates[:10]:
+            item['speed_mbps'] = 0.0
+            final_nodes.append(item)
 
     final_nodes.sort(key=lambda x: x['speed_mbps'], reverse=True)
     return final_nodes
@@ -289,7 +269,7 @@ async def main():
     tested_nodes = await run_full_test(raw_configs)
     
     top_nodes = tested_nodes[:20]
-    print(f"Успешно прошли замер скорости: {len(top_nodes)} узлов")
+    print(f"Итого отобрано узлов: {len(top_nodes)}")
 
     out_configs = [item['config'] for item in top_nodes]
     with open("sub.txt", "w", encoding="utf-8") as f:
@@ -298,7 +278,7 @@ async def main():
     with open("sub_base64.txt", "w", encoding="utf-8") as f:
         f.write(base64.b64encode("\n".join(out_configs).encode('utf-8')).decode('utf-8'))
 
-    # Формируем готовый nodes.json
+    # Формируем nodes.json
     sb_outbounds = []
     tags = []
     for idx, item in enumerate(top_nodes):
@@ -325,9 +305,9 @@ async def main():
     repo_name = os.environ.get('GITHUB_REPOSITORY', 'tlmanfred/vpn-auto-filter')
     msg = (
         f"🚀 **Тестирование скорости завершено!**\n\n"
-        f"📊 **Статистика:**\n"
+        f"📊 **Результаты:**\n"
         f"• Всего обработано: `{len(raw_configs)}`\n"
-        f"• Прошли замер скорости скачивания: `{len(top_nodes)}`\n\n"
+        f"• Отобрано в подписку: `{len(top_nodes)}`\n\n"
         f"🏆 **ТОП-5 по скорости скачивания:**\n{top_stats_str}\n\n"
         f"🔗 **Ссылка подписки:**\n"
         f"`https://raw.githubusercontent.com/{repo_name}/main/sub.txt`"
