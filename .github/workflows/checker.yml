@@ -1,0 +1,38 @@
+name: VPN Auto Checker and Updater
+
+on:
+  schedule:
+    # Запуск каждые 2 часа
+    - cron: '0 */2 * * *'
+  workflow_dispatch: # Возможность запустить вручную одной кнопкой
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Чекaут репозитория
+        uses: actions/checkout@v3
+
+      - name: Установка Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Установка зависимостей
+        run: |
+          pip install aiohttp
+
+      - name: Запуск проверки
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python test_vpn.py
+
+      - name: Сохранение результатов в GitHub
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add sub.txt sub_base64.txt
+          git commit -m "Auto-update TOP-20 VPN configs" || exit 0
+          git push
