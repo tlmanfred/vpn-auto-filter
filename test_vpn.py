@@ -6,278 +6,307 @@ import urllib.request
 import urllib.parse
 import time
 import asyncio
+import subprocess
 import aiohttp
-import random
 
-# Источники подписок
 SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_SS%2BAll_RUS.txt",
     "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/1.txt",
     "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/26.txt"
 ]
 
-PRIORITY_COUNTRIES = ['NL', 'DE', 'FR']  # Нидерланды, Германия, Франция
-MAX_OUTPUT_NODES = 150                    # Объём подписки для Podkop / Throne
-MAX_PER_SUBNET = 2                       # Максимум 2 узла с одной /24 подсети IP
+TEST_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=10000000"  # Тестовый файл 10МБ
+SPEED_TEST_DURATION = 3.0  # Замер задержки/скорости скачивания длится макс. 3 секунды на узел
 
 def decode_base64_if_needed(content):
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     decoded_lines = []
-    
     for line in lines:
-        if any(line.startswith(p) for p in ['vless://', 'ss://', 'trojan://', 'vmess://', 'hysteria2://', 'hy2://']):
+        if any(line.startswith(p) for p in ['vless://', 'ss://', 'trojan://']):
             decoded_lines.append(line)
         else:
             try:
-                clean_line = line.replace('-', '+').replace('_', '/')
-                missing_padding = len(clean_line) % 4
-                if missing_padding:
-                    clean_line += '=' * (4 - missing_padding)
-                decoded = base64.b64decode(clean_line).decode('utf-8', errors='ignore')
-                for d_line in decoded.splitlines():
-                    d_clean = d_line.strip()
-                    if any(d_clean.startswith(p) for p in ['vless://', 'ss://', 'trojan://', 'vmess://', 'hysteria2://', 'hy2://']):
-                        decoded_lines.append(d_clean)
+                clean = line.replace('-', '+').replace('_', '/')
+                pad = len(clean) % 4
+                if pad: clean += '=' * (4 - pad)
+                decoded = base64.b64decode(clean).decode('utf-8', errors='ignore')
+                for d in decoded.splitlines():
+                    if any(d.strip().startswith(p) for p in ['vless://', 'ss://', 'trojan://']):
+                        decoded_lines.append(d.strip())
             except Exception:
                 pass
-                
     return decoded_lines if decoded_lines else lines
-
-def get_protocol_priority(config):
-    """
-    Приоритет устойчивости к ТСПУ:
-    0 — VLESS Reality (самый стойкий)
-    1 — VLESS / Trojan
-    2 — Shadowsocks / VMess
-    """
-    cfg_lower = config.lower()
-    if cfg_lower.startswith('vless://'):
-        if 'security=reality' in cfg_lower or 'pbk=' in cfg_lower:
-            return 0
-        return 1
-    elif cfg_lower.startswith('trojan://'):
-        return 1
-    elif cfg_lower.startswith('ss://') or cfg_lower.startswith('vmess://'):
-        return 2
-    return 3
 
 def fetch_configs():
     all_configs = []
     for url in SOURCES:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=12) as response:
-                raw_data = response.read().decode('utf-8', errors='ignore')
-                lines = decode_base64_if_needed(raw_data)
-                all_configs.extend(lines)
-                print(f"Загружено из {url}: {len(lines)} строк")
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                all_configs.extend(decode_base64_if_needed(resp.read().decode('utf-8', errors='ignore')))
         except Exception as e:
             print(f"Ошибка загрузки {url}: {e}")
     
-    valid_configs = []
-    for c in all_configs:
-        c_clean = c.strip('\ufeff\r\n ')
-        if any(c_clean.startswith(proto) for proto in ['vless://', 'ss://', 'trojan://', 'vmess://']):
-            valid_configs.append(c_clean)
-            
-    unique_configs = list(set(valid_configs))
-    print(f"Всего распознано уникальных конфигов: {len(unique_configs)}")
-    return unique_configs
+    valid = [c.strip('\ufeff\r\n ') for c in all_configs if any(c.strip().startswith(p) for p in ['vless://', 'trojan://'])]
+    return list(set(valid))
 
-def parse_host_port(config):
+def vless_to_singbox(url_str, tag_name):
     try:
-        clean_cfg = config.split('#')[0].split('?')[0]
-        if '@' in clean_cfg:
-            target = clean_cfg.split('@')[-1]
-            if target.startswith('['):
-                host = target.split(']')[0] + ']'
-                port_str = target.split(']:')[1]
-            else:
-                if ':' in target:
-                    host, port_str = target.rsplit(':', 1)
-                else:
-                    return None, None
-            
-            host = host.strip('/ ')
-            port_digits = re.sub(r'\D', '', port_str)
-            if port_digits:
-                port = int(port_digits)
-                if host and 1 <= port <= 65535:
-                    return host, port
-    except Exception:
-        pass
-    return None, None
+        parsed = urllib.parse.urlparse(url_str)
+        uuid = parsed.username
+        host = parsed.hostname
+        port = parsed.port
+        params = urllib.parse.parse_qs(parsed.query)
 
-async def tcp_ping(host, port, timeout=2.0):
-    start = time.time()
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-        writer.close()
-        await writer.wait_closed()
-        latency = (time.time() - start) * 1000
-        return round(latency, 1)
+        if not host or not port or not uuid:
+            return None
+
+        outbound = {
+            "type": "vless",
+            "tag": tag_name,
+            "server": host,
+            "server_port": int(port),
+            "uuid": uuid,
+        }
+
+        flow = params.get('flow', [None])[0]
+        if flow: outbound["flow"] = flow
+
+        security = params.get('security', ['none'])[0]
+        if security in ['tls', 'reality']:
+            tls_conf = {"enabled": True, "server_name": params.get('sni', [host])[0], "insecure": True}
+            if security == 'reality':
+                tls_conf["reality"] = {
+                    "enabled": True,
+                    "public_key": params.get('pbk', [''])[0],
+                    "short_id": params.get('sid', [''])[0]
+                }
+            outbound["tls"] = tls_conf
+
+        transport = params.get('type', ['tcp'])[0]
+        if transport == 'ws':
+            outbound["transport"] = {
+                "type": "ws",
+                "path": params.get('path', ['/'])[0],
+                "headers": {"Host": params.get('host', [host])[0]}
+            }
+        elif transport == 'grpc':
+            outbound["transport"] = {
+                "type": "grpc",
+                "service_name": params.get('serviceName', [''])[0]
+            }
+
+        return outbound
     except Exception:
         return None
 
-async def get_geoip_batch(hosts):
-    country_map = {}
-    if not hosts:
-        return country_map
+async def test_download_speed(session, proxy_url):
+    """Измеряет реальную скорость СКАЧИВАНИЯ (Download Speed) в Мбит/с"""
+    start_time = time.time()
+    downloaded_bytes = 0
+    try:
+        async with session.get(TEST_DOWNLOAD_URL, proxy=proxy_url, timeout=SPEED_TEST_DURATION + 1) as response:
+            if response.status != 200:
+                return 0.0
+            
+            while True:
+                chunk = await response.content.read(65536)
+                if not chunk:
+                    break
+                downloaded_bytes += len(chunk)
+                if time.time() - start_time >= SPEED_TEST_DURATION:
+                    break
+
+        elapsed = time.time() - start_time
+        if elapsed <= 0 or downloaded_bytes == 0:
+            return 0.0
+
+        # Перевод в Мегабиты в секунду (Mbps)
+        speed_mbps = (downloaded_bytes * 8) / (elapsed * 1_000_000)
+        return round(speed_mbps, 2)
+    except Exception:
+        return 0.0
+
+async def run_full_test(configs):
+    outbounds = []
+    config_map = {}
+    tags = []
     
-    hosts_list = list(hosts)
-    chunk_size = 100
+    for idx, cfg in enumerate(configs):
+        tag = f"node-{idx}"
+        sb_obj = vless_to_singbox(cfg, tag)
+        if sb_obj:
+            outbounds.append(sb_obj)
+            config_map[tag] = cfg
+            tags.append(tag)
+
+    if not outbounds:
+        return []
+
+    # Группа-селектор для переключения активного узла при тесте скорости
+    selector_group = {
+        "type": "selector",
+        "tag": "speed-tester",
+        "outbounds": tags
+    }
+    outbounds.append(selector_group)
+
+    test_config = {
+        "log": {"level": "warn"},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 1080
+            }
+        ],
+        "experimental": {
+            "clash_api": {
+                "external_controller": "127.0.0.1:9090"
+            }
+        },
+        "outbounds": outbounds
+    }
+
+    with open("temp_runner.json", "w", encoding="utf-8") as f:
+        json.dump(test_config, f)
+
+    proc = subprocess.Popen(["./sing-box", "run", "-c", "temp_runner.json"])
+    await asyncio.sleep(3)
+
+    delay_passed_nodes = []
     
+    # -------------------------------------------------------------
+    # ЭТАП 1: Быстрый отсев по задержке (HTTP 204)
+    # -------------------------------------------------------------
+    print("🔹 Этап 1: Проверка задержки и отклика (HTTP 204)...")
     async with aiohttp.ClientSession() as session:
-        for i in range(0, len(hosts_list), chunk_size):
-            chunk = hosts_list[i:i + chunk_size]
-            payload = json.dumps([{"query": h} for h in chunk]).encode('utf-8')
+        for tag, cfg in config_map.items():
+            test_url = f"http://127.0.0.1:9090/proxies/{urllib.parse.quote(tag)}/delay?url=http://cp.cloudflare.com/generate_204&timeout=2000"
             try:
-                async with session.post("http://ip-api.com/batch?fields=query,countryCode,country", data=payload, timeout=10) as response:
-                    data = await response.json()
-                    for item in data:
-                        query_host = item.get('query')
-                        cc = item.get('countryCode', 'UNKNOWN')
-                        country = item.get('country', 'Unknown')
-                        country_map[query_host] = (cc, country)
+                async with session.get(test_url, timeout=2.5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        delay = data.get("delay", 0)
+                        if delay > 0:
+                            delay_passed_nodes.append({'config': cfg, 'delay': delay, 'tag': tag})
+            except Exception:
+                pass
+
+    print(f"Ответили на запрос задержки: {len(delay_passed_nodes)} узлов.")
+    if not delay_passed_nodes:
+        proc.terminate()
+        proc.wait()
+        return []
+
+    # Сортируем кандидатные узлы по задержке и берем ТОП-30 для детальной проверки скорости
+    delay_passed_nodes.sort(key=lambda x: x['delay'])
+    candidates_for_speedtest = delay_passed_nodes[:30]
+
+    # -------------------------------------------------------------
+    # ЭТАП 2: Замер скорости СКАЧИВАНИЯ (Download Speed)
+    # -------------------------------------------------------------
+    print("🔹 Этап 2: Тестирование СКОРОСТИ СКАЧИВАНИЯ (Download Speed)...")
+    final_nodes = []
+    proxy_local_url = "http://127.0.0.1:1080"
+
+    async with aiohttp.ClientSession() as session:
+        for item in candidates_for_speedtest:
+            tag = item['tag']
+            
+            # Переключаем прокси-селектор на текущий узел через Clash API
+            switch_payload = json.dumps({"name": tag}).encode('utf-8')
+            req = urllib.request.Request(
+                "http://127.0.0.1:9090/proxies/speed-tester",
+                data=switch_payload,
+                headers={"Content-Type": "application/json"},
+                method="PUT"
+            )
+            try:
+                urllib.request.urlopen(req, timeout=2)
             except Exception as e:
-                print(f"GeoIP error: {e}")
-    return country_map
+                print(f"Ошибка переключения селектора на {tag}: {e}")
+                continue
 
-def extract_subnet(host):
-    """Извлекает /24 подсеть для IP или домена"""
-    parts = host.split('.')
-    if len(parts) == 4 and all(p.isdigit() for p in parts):
-        return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
-    return host  # Для доменов возвращаем сам хост
-
-async def filter_and_rank(configs):
-    candidates = []
-    ip_to_check = set()
-    
-    for cfg in configs:
-        host, port = parse_host_port(cfg)
-        if host and port:
-            candidates.append({
-                'config': cfg,
-                'host': host,
-                'port': port,
-                'proto_priority': get_protocol_priority(cfg)
-            })
-            ip_to_check.add(host)
-
-    print(f"К проверке TCP-доступности подготовлено узлов: {len(candidates)}")
-    if not candidates:
-        return [], len(configs), 0
-
-    # Проверяем базовую доступность портов
-    tasks = [tcp_ping(c['host'], c['port']) for c in candidates]
-    pings = await asyncio.gather(*tasks)
-
-    alive_candidates = []
-    alive_ips = set()
-    for item, ping in zip(candidates, pings):
-        if ping is not None:
-            item['ping'] = ping
-            alive_candidates.append(item)
-            alive_ips.add(item['host'])
-
-    print(f"Живых узлов ответило на порт: {len(alive_candidates)}")
-
-    # Определение стран через GeoIP
-    geo_map = await get_geoip_batch(alive_ips)
-    
-    for item in alive_candidates:
-        code, country = geo_map.get(item['host'], ('UNKNOWN', 'Unknown'))
-        item['country_code'] = code
-        item['country_name'] = country
-        item['subnet'] = extract_subnet(item['host'])
-
-    # Делим узлы на приоритетные страны (NL, DE, FR) и остальные
-    priority_nodes = [c for c in alive_candidates if c['country_code'] in PRIORITY_COUNTRIES]
-    other_nodes = [c for c in alive_candidates if c['country_code'] not in PRIORITY_COUNTRIES]
-
-    # Сортируем: сначала VLESS Reality / Trojan, затем случайное перемешивание для равномерности
-    for pool in [priority_nodes, other_nodes]:
-        random.shuffle(pool)
-        pool.sort(key=lambda x: x['proto_priority'])
-
-    selected_nodes = []
-    subnet_counts = {}
-
-    # Набор узлов с ограничением по подсетям (не более MAX_PER_SUBNET на подсеть)
-    for pool in [priority_nodes, other_nodes]:
-        for node in pool:
-            if len(selected_nodes) >= MAX_OUTPUT_NODES:
-                break
+            # Измеряем реальную скорость скачивания
+            download_speed_mbps = await test_download_speed(session, proxy_local_url)
             
-            sub = node['subnet']
-            current_count = subnet_counts.get(sub, 0)
-            
-            if current_count < MAX_PER_SUBNET:
-                selected_nodes.append(node)
-                subnet_counts[sub] = current_count + 1
+            if download_speed_mbps > 0.5:  # Фильтруем узлы медленнее 0.5 Мбит/с
+                item['speed_mbps'] = download_speed_mbps
+                final_nodes.append(item)
+                print(f"⚡ Узел {tag}: Скорость скачивания = {download_speed_mbps} Мбит/с | Пинг = {item['delay']} ms")
+            else:
+                print(f"❌ Узел {tag}: Низкая скорость или обрыв скачивания (<0.5 Мбит/с)")
 
-    return selected_nodes, len(configs), len(alive_candidates)
+    proc.terminate()
+    proc.wait()
+
+    # Сортируем узлы в первую очередь по СКОРОСТИ СКАЧИВАНИЯ (по убыванию)
+    final_nodes.sort(key=lambda x: x['speed_mbps'], reverse=True)
+    return final_nodes
 
 def send_telegram_message(text):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("Telegram не настроен.")
-        return
+    if not token or not chat_id: return
     
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
     req = urllib.request.Request(url, data=payload.encode('utf-8'), headers={'Content-Type': 'application/json'})
-    try:
-        urllib.request.urlopen(req)
-    except Exception as e:
-        print(f"Ошибка отправки Telegram: {e}")
+    try: urllib.request.urlopen(req)
+    except Exception: pass
 
 async def main():
-    configs = fetch_configs()
-    top_nodes, total_raw, total_alive = await filter_and_rank(configs)
+    raw_configs = fetch_configs()
+    print(f"Всего загружено конфигураций: {len(raw_configs)}")
+    
+    tested_nodes = await run_full_test(raw_configs)
+    
+    top_nodes = tested_nodes[:20]
+    print(f"Прошли проверку скорости скачивания: {len(top_nodes)} узлов")
 
     out_configs = [item['config'] for item in top_nodes]
-    sub_text = "\n".join(out_configs)
-    
     with open("sub.txt", "w", encoding="utf-8") as f:
-        f.write(sub_text)
+        f.write("\n".join(out_configs))
 
     with open("sub_base64.txt", "w", encoding="utf-8") as f:
-        f.write(base64.b64encode(sub_text.encode('utf-8')).decode('utf-8'))
+        f.write(base64.b64encode("\n".join(out_configs).encode('utf-8')).decode('utf-8'))
 
-    country_stats = {}
-    proto_stats = {"VLESS Reality": 0, "VLESS/Trojan": 0, "SS/VMess": 0}
+    # Формируем nodes.json
+    sb_outbounds = []
+    tags = []
+    for idx, item in enumerate(top_nodes):
+        tag = f"node-{idx+1}-{item['speed_mbps']}Mbps"
+        sb_obj = vless_to_singbox(item['config'], tag)
+        if sb_obj:
+            sb_outbounds.append(sb_obj)
+            tags.append(tag)
 
-    for item in top_nodes:
-        cc = item['country_code']
-        country_stats[cc] = country_stats.get(cc, 0) + 1
-        
-        p = item['proto_priority']
-        if p == 0:
-            proto_stats["VLESS Reality"] += 1
-        elif p == 1:
-            proto_stats["VLESS/Trojan"] += 1
-        else:
-            proto_stats["SS/VMess"] += 1
+    if tags:
+        sb_outbounds.append({
+            "type": "urltest",
+            "tag": "auto-outbound",
+            "outbounds": tags,
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": "5m"
+        })
 
-    country_str = "\n".join([f"• `{cc}`: {count} шт." for cc, count in country_stats.items()]) if top_nodes else "• Нет"
-    proto_str = "\n".join([f"• {k}: {v} шт." for k, v in proto_stats.items() if v > 0])
+    with open("nodes.json", "w", encoding="utf-8") as f:
+        json.dump({"outbounds": sb_outbounds}, f, indent=2, ensure_ascii=False)
+
+    top_stats_str = "\n".join([f"• `{item['speed_mbps']} Мбит/с` (отклик {item['delay']} ms)" for item in top_nodes[:5]]) if top_nodes else "• Нет серверов, прошедших тест скорости"
 
     repo_name = os.environ.get('GITHUB_REPOSITORY', 'tlmanfred/vpn-auto-filter')
     msg = (
-        f"⚡️ **Диверсифицированная VPN-подписка готова!**\n\n"
-        f"📊 **Статистика фильтрации:**\n"
-        f"• Обработано источников: `{total_raw}`\n"
-        f"• Ответило на порт: `{total_alive}`\n"
-        f"• Отобрано в подписку: `{len(top_nodes)}` (различные подсети)\n\n"
-        f"🛡 **Протоколы в подписке:**\n{proto_str}\n\n"
-        f"🌍 **География подписки:**\n{country_str}\n\n"
-        f"🚀 **Ссылка подписки для Podkop и Throne:**\n"
+        f"🚀 **Тестирование скорости скачивания завершено!**\n\n"
+        f"📊 **Результаты:**\n"
+        f"• Всего обработано: `{len(raw_configs)}`\n"
+        f"• Прошли тест скорости скачивания: `{len(top_nodes)}`\n\n"
+        f"🏆 **ТОП-5 по скорости скачивания:**\n{top_stats_str}\n\n"
+        f"🔗 **Ссылка подписки:**\n"
         f"`https://raw.githubusercontent.com/{repo_name}/main/sub.txt`"
     )
     send_telegram_message(msg)
