@@ -7,6 +7,7 @@ import urllib.parse
 import time
 import asyncio
 import aiohttp
+import random
 
 # Источники подписок
 SOURCES = [
@@ -19,6 +20,8 @@ SOURCES = [
 ]
 
 PRIORITY_COUNTRIES = ['NL', 'DE', 'FR']  # Нидерланды, Германия, Франция
+MAX_OUTPUT_NODES = 150                    # Объём подписки для Podkop / Throne
+MAX_PER_SUBNET = 2                       # Максимум 2 узла с одной /24 подсети IP
 
 def decode_base64_if_needed(content):
     lines = [line.strip() for line in content.splitlines() if line.strip()]
@@ -42,6 +45,24 @@ def decode_base64_if_needed(content):
                 pass
                 
     return decoded_lines if decoded_lines else lines
+
+def get_protocol_priority(config):
+    """
+    Приоритет устойчивости к ТСПУ:
+    0 — VLESS Reality (самый стойкий)
+    1 — VLESS / Trojan
+    2 — Shadowsocks / VMess
+    """
+    cfg_lower = config.lower()
+    if cfg_lower.startswith('vless://'):
+        if 'security=reality' in cfg_lower or 'pbk=' in cfg_lower:
+            return 0
+        return 1
+    elif cfg_lower.startswith('trojan://'):
+        return 1
+    elif cfg_lower.startswith('ss://') or cfg_lower.startswith('vmess://'):
+        return 2
+    return 3
 
 def fetch_configs():
     all_configs = []
@@ -69,7 +90,6 @@ def fetch_configs():
 def parse_host_port(config):
     try:
         clean_cfg = config.split('#')[0].split('?')[0]
-        
         if '@' in clean_cfg:
             target = clean_cfg.split('@')[-1]
             if target.startswith('['):
@@ -91,7 +111,7 @@ def parse_host_port(config):
         pass
     return None, None
 
-async def tcp_ping(host, port, timeout=2.5):
+async def tcp_ping(host, port, timeout=2.0):
     start = time.time()
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
@@ -126,6 +146,13 @@ async def get_geoip_batch(hosts):
                 print(f"GeoIP error: {e}")
     return country_map
 
+def extract_subnet(host):
+    """Извлекает /24 подсеть для IP или домена"""
+    parts = host.split('.')
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    return host  # Для доменов возвращаем сам хост
+
 async def filter_and_rank(configs):
     candidates = []
     ip_to_check = set()
@@ -133,13 +160,19 @@ async def filter_and_rank(configs):
     for cfg in configs:
         host, port = parse_host_port(cfg)
         if host and port:
-            candidates.append({'config': cfg, 'host': host, 'port': port})
+            candidates.append({
+                'config': cfg,
+                'host': host,
+                'port': port,
+                'proto_priority': get_protocol_priority(cfg)
+            })
             ip_to_check.add(host)
 
-    print(f"К проверке TCP-пинга подготовлено узлов: {len(candidates)}")
+    print(f"К проверке TCP-доступности подготовлено узлов: {len(candidates)}")
     if not candidates:
         return [], len(configs), 0
 
+    # Проверяем базовую доступность портов
     tasks = [tcp_ping(c['host'], c['port']) for c in candidates]
     pings = await asyncio.gather(*tasks)
 
@@ -151,22 +184,43 @@ async def filter_and_rank(configs):
             alive_candidates.append(item)
             alive_ips.add(item['host'])
 
-    print(f"Живых узлов ответило на пинг: {len(alive_candidates)}")
+    print(f"Живых узлов ответило на порт: {len(alive_candidates)}")
 
+    # Определение стран через GeoIP
     geo_map = await get_geoip_batch(alive_ips)
     
     for item in alive_candidates:
         code, country = geo_map.get(item['host'], ('UNKNOWN', 'Unknown'))
         item['country_code'] = code
         item['country_name'] = country
-        
-        priority_weight = 0 if code in PRIORITY_COUNTRIES else 1
-        item['rank_score'] = (priority_weight, item['ping'])
+        item['subnet'] = extract_subnet(item['host'])
 
-    alive_candidates.sort(key=lambda x: x['rank_score'])
+    # Делим узлы на приоритетные страны (NL, DE, FR) и остальные
+    priority_nodes = [c for c in alive_candidates if c['country_code'] in PRIORITY_COUNTRIES]
+    other_nodes = [c for c in alive_candidates if c['country_code'] not in PRIORITY_COUNTRIES]
 
-    top_20 = alive_candidates[:20]
-    return top_20, len(configs), len(alive_candidates)
+    # Сортируем: сначала VLESS Reality / Trojan, затем случайное перемешивание для равномерности
+    for pool in [priority_nodes, other_nodes]:
+        random.shuffle(pool)
+        pool.sort(key=lambda x: x['proto_priority'])
+
+    selected_nodes = []
+    subnet_counts = {}
+
+    # Набор узлов с ограничением по подсетям (не более MAX_PER_SUBNET на подсеть)
+    for pool in [priority_nodes, other_nodes]:
+        for node in pool:
+            if len(selected_nodes) >= MAX_OUTPUT_NODES:
+                break
+            
+            sub = node['subnet']
+            current_count = subnet_counts.get(sub, 0)
+            
+            if current_count < MAX_PER_SUBNET:
+                selected_nodes.append(node)
+                subnet_counts[sub] = current_count + 1
+
+    return selected_nodes, len(configs), len(alive_candidates)
 
 def send_telegram_message(text):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -185,9 +239,9 @@ def send_telegram_message(text):
 
 async def main():
     configs = fetch_configs()
-    top_20, total_raw, total_alive = await filter_and_rank(configs)
+    top_nodes, total_raw, total_alive = await filter_and_rank(configs)
 
-    out_configs = [item['config'] for item in top_20]
+    out_configs = [item['config'] for item in top_nodes]
     sub_text = "\n".join(out_configs)
     
     with open("sub.txt", "w", encoding="utf-8") as f:
@@ -197,21 +251,33 @@ async def main():
         f.write(base64.b64encode(sub_text.encode('utf-8')).decode('utf-8'))
 
     country_stats = {}
-    for item in top_20:
+    proto_stats = {"VLESS Reality": 0, "VLESS/Trojan": 0, "SS/VMess": 0}
+
+    for item in top_nodes:
         cc = item['country_code']
         country_stats[cc] = country_stats.get(cc, 0) + 1
+        
+        p = item['proto_priority']
+        if p == 0:
+            proto_stats["VLESS Reality"] += 1
+        elif p == 1:
+            proto_stats["VLESS/Trojan"] += 1
+        else:
+            proto_stats["SS/VMess"] += 1
 
-    stats_str = "\n".join([f"• `{cc}`: {count} шт." for cc, count in country_stats.items()]) if top_20 else "• Нет доступных узлов"
-    
+    country_str = "\n".join([f"• `{cc}`: {count} шт." for cc, count in country_stats.items()]) if top_nodes else "• Нет"
+    proto_str = "\n".join([f"• {k}: {v} шт." for k, v in proto_stats.items() if v > 0])
+
     repo_name = os.environ.get('GITHUB_REPOSITORY', 'tlmanfred/vpn-auto-filter')
     msg = (
-        f"⚡️ **Обновление VPN-подписки готово!**\n\n"
-        f"📊 **Статистика:**\n"
-        f"• Обработано: `{total_raw}`\n"
-        f"• Доступно: `{total_alive}`\n"
-        f"• Отобрано в ТОП-20: `{len(top_20)}`\n\n"
-        f"🌍 **Страны в ТОП-20:**\n{stats_str}\n\n"
-        f"🚀 **Ссылка подписки для Throne и Podkop:**\n"
+        f"⚡️ **Диверсифицированная VPN-подписка готова!**\n\n"
+        f"📊 **Статистика фильтрации:**\n"
+        f"• Обработано источников: `{total_raw}`\n"
+        f"• Ответило на порт: `{total_alive}`\n"
+        f"• Отобрано в подписку: `{len(top_nodes)}` (различные подсети)\n\n"
+        f"🛡 **Протоколы в подписке:**\n{proto_str}\n\n"
+        f"🌍 **География подписки:**\n{country_str}\n\n"
+        f"🚀 **Ссылка подписки для Podkop и Throne:**\n"
         f"`https://raw.githubusercontent.com/{repo_name}/main/sub.txt`"
     )
     send_telegram_message(msg)
