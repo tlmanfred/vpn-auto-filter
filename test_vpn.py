@@ -17,7 +17,6 @@ SOURCES = [
 ]
 
 TEST_DOWNLOAD_URL = "http://cachefly.cachefly.net/10mb.test"
-# Снижаем нагрузку на канал GitHub Runner для более точного замера (было 8, стало 4)
 CONCURRENCY_LIMIT = 4 
 
 def decode_base64_if_needed(content):
@@ -90,10 +89,9 @@ def config_to_singbox(url_str, tag_name):
         return None
 
 async def check_single_delay(session, tag):
-    """Асинхронный пинг. Увеличен таймаут ожидания до 5 секунд (5000мс)."""
+    """Асинхронный пинг через Clash API с таймаутом 5 секунд."""
     test_url = f"http://127.0.0.1:9090/proxies/{urllib.parse.quote(tag)}/delay?url=http://cp.cloudflare.com/generate_204&timeout=5000"
     try:
-        # Сессии даем чуть больше времени, чем самому Clash
         async with session.get(test_url, timeout=7.0) as resp:
             if resp.status == 200:
                 data = await resp.json()
@@ -118,11 +116,9 @@ async def measure_speed_concurrently(item, worker_id, sem):
 
         sb_proc = await asyncio.create_subprocess_exec("./sing-box", "run", "-c", conf_path, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         
-        # ДАЕМ ВРЕМЯ НА HANDSHAKE: 4 секунды (хватит даже самым медленным Reality-серверам)
         await asyncio.sleep(4.0) 
 
         speed_mbps = 0.0
-        # CURL: 10 сек на подключение, 20 сек на скачивание. Позволяет измерить реальную среднюю скорость.
         curl_cmd = [
             "curl", "-k", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
             "--connect-timeout", "10", "--max-time", "20",
@@ -131,7 +127,6 @@ async def measure_speed_concurrently(item, worker_id, sem):
         
         try:
             curl_proc = await asyncio.create_subprocess_exec(*curl_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            # Ждем завершения curl с запасом (25 сек)
             stdout, _ = await asyncio.wait_for(curl_proc.communicate(), timeout=25.0)
             out = stdout.decode().strip()
             speed_bytes_sec = float(out) if out else 0.0
@@ -146,7 +141,7 @@ async def measure_speed_concurrently(item, worker_id, sem):
         if speed_mbps > 0.05:
             print(f"✅ {item['tag']}: {speed_mbps} Мбит/с | Пинг: {item['delay']} ms")
         else:
-            print(f"❌ {item['tag']}: 0 Мбит/с | Пинг: {item['delay']} ms (Таймаут или обрыв)")
+            print(f"❌ {item['tag']}: 0 Мбит/с | Пинг: {item['delay']} ms")
             
         return item
 
@@ -173,13 +168,20 @@ async def run_full_test(configs):
         json.dump(test_config, f)
 
     proc = subprocess.Popen(["./sing-box", "run", "-c", "temp_runner.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    await asyncio.sleep(4) # Даем больше времени ядру на парсинг сотен конфигов
+    await asyncio.sleep(5) # Даем время ядру инициализировать тысячи конфигов
 
-    print("🔹 Этап 1: МАССОВЫЙ асинхронный пинг (таймаут 5 сек)...")
+    print("🔹 Этап 1: МАССОВЫЙ асинхронный пинг (с ограничением потоков)...")
     delay_passed_nodes = []
     
+    # Ограничиваем до 50 одновременных запросов к API, чтобы не перегрузить sing-box
+    sem_delay = asyncio.Semaphore(50)
+
+    async def bounded_check(session, tag):
+        async with sem_delay:
+            return await check_single_delay(session, tag)
+
     async with aiohttp.ClientSession() as session:
-        tasks = [check_single_delay(session, tag) for tag in config_map.keys()]
+        tasks = [bounded_check(session, tag) for tag in config_map.keys()]
         results = await asyncio.gather(*tasks) 
         
         for tag, delay in results:
@@ -193,8 +195,6 @@ async def run_full_test(configs):
     if not delay_passed_nodes: return []
 
     delay_passed_nodes.sort(key=lambda x: x['delay'])
-    
-    # Расширяем воронку проверки: тестируем скорость для ТОП-60 серверов
     candidates = delay_passed_nodes[:60] 
 
     print(f"🔹 Этап 2: Точный замер скорости ({CONCURRENCY_LIMIT} потока, до 20 сек на узел)...")
@@ -210,7 +210,6 @@ async def run_full_test(configs):
     valid_nodes = [n for n in final_nodes if n['speed_mbps'] > 0.05]
     
     if not valid_nodes:
-        print("⚠️ Ни один узел не пробил тест скорости. Отдаем по минимальному пингу!")
         for item in candidates[:20]:
             item['speed_mbps'] = 0.0
             valid_nodes.append(item)
@@ -233,12 +232,16 @@ async def main():
     raw_configs = fetch_configs()
     tested_nodes = await run_full_test(raw_configs)
     
-    # Сохраняем ТОП-25 самых быстрых и стабильных
     top_nodes = tested_nodes[:25] 
     out_configs = [item['config'] for item in top_nodes]
     
     with open("sub.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(out_configs))
+
+    # Создаем версию в base64 на всякий случай
+    sub_base64_str = base64.b64encode("\n".join(out_configs).encode('utf-8')).decode('utf-8')
+    with open("sub_base64.txt", "w", encoding="utf-8") as f:
+        f.write(sub_base64_str)
 
     sb_outbounds = []
     tags = []
