@@ -2,15 +2,14 @@ name: VPN Auto Checker and Updater
 
 on:
   schedule:
-    # Запуск каждые 2 часа
-    - cron: '0 */2 * * *'
-  workflow_dispatch: # Возможность запустить вручную одной кнопкой
+    - cron: '0 */4 * * *'  # Запуск каждые 4 часа
+  workflow_dispatch:
 
 jobs:
   check-and-update:
     runs-on: ubuntu-latest
     steps:
-      - name: Чекaут репозитория
+      - name: Чтение репозитория
         uses: actions/checkout@v3
 
       - name: Установка Python
@@ -18,21 +17,28 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Установка зависимостей
+      - name: Установка sing-box (ядро Throne)
         run: |
-          pip install aiohttp
+          SBOX_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')
+          curl -Lo sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SBOX_VER}/sing-box-${SBOX_VER}-linux-amd64.tar.gz"
+          tar -xzf sing-box.tar.gz
+          mv sing-box-*/sing-box ./sing-box
+          chmod +x ./sing-box
+          ./sing-box version
 
-      - name: Запуск проверки
+      - name: Установка зависимостей Python
+        run: pip install aiohttp
+
+      - name: Запуск РЕАЛЬНОГО тестирования через sing-box
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python test_vpn.py
 
-      - name: Сохранение результатов в GitHub
+      - name: Коммит и пуш результатов
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add sub.txt sub_base64.txt
-          git commit -m "Auto-update TOP-20 VPN configs" || exit 0
+          git add sub.txt sub_base64.txt nodes.json || true
+          git commit -m "Auto-update verified VPN configs (real HTTP test)" || true
           git push
